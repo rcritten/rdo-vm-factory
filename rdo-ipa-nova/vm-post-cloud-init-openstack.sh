@@ -90,8 +90,10 @@ else
         sed -i 's/CONFIG_NEUTRON_OVS_TUNNEL_TYPES=.*$/CONFIG_NEUTRON_OVS_TUNNEL_TYPES=vxlan/g' /root/answerfile.txt
     fi
     # neutron doesn't like NetworkManager
-    systemctl stop NetworkManager.service
-    systemctl disable NetworkManager.service
+    if systemctl status NetworkManager.service ; then
+        systemctl stop NetworkManager.service
+        systemctl disable NetworkManager.service
+    fi
 fi
 sed -i "s/CONFIG_\(.*\)_PW=.*/CONFIG_\1_PW=$OPENSTACK_PASSWORD/g" /root/answerfile.txt
 sed -i 's/CONFIG_KEYSTONE_SERVICE_NAME=keystone/CONFIG_KEYSTONE_SERVICE_NAME=httpd/g' /root/answerfile.txt

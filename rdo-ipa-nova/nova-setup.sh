@@ -50,7 +50,11 @@ chmod 0600 /etc/nova/ipauser.keytab
 
 # need a real el7 image in order to run ipa-client-install
 . /root/keystonerc_admin
-openstack image create rhel7 --file $SOURCE_DIR/rhel-guest-image-7.1-20150224.0.x86_64.qcow2
+#if [ -n "$USE_CENTOS" ] ; then
+    openstack image create el7 --file $SOURCE_DIR/CentOS-7-x86_64-GenericCloud.qcow2
+#else
+#    openstack image create el7 --file $SOURCE_DIR/rhel-guest-image-7.1-20150224.0.x86_64.qcow2
+#fi
 
 # tell dhcp agent which DNS servers to use - use IPA first
 openstack-config --set /etc/neutron/dhcp_agent.ini DEFAULT dnsmasq_dns_servers $IPA_IP,$VM_IP
@@ -179,21 +183,21 @@ if [ -z "$netid" ] ; then
 fi
 
 if [ -n "$DEMO_SETUP" ] ; then
-    echo openstack server create rhel7 --flavor m1.small --image rhel7 --security-group default \
+    echo openstack server create el7 --flavor m1.small --image el7 --security-group default \
          --nic net-id=$netid --property ipaclass=app_server
     exit 0
 fi
 
-VM_UUID=$(openstack server create rhel7 --flavor m1.small --image rhel7 --security-group default --nic net-id=$netid --property ipaclass=app_server | awk '/ id / {print $4}')
+VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server | awk '/ id / {print $4}')
 
 ii=$BOOT_TIMEOUT
 while [ $ii -gt 0 ] ; do
-    if openstack server show rhel7|grep ACTIVE ; then
+    if openstack server show el7|grep ACTIVE ; then
         break
     fi
-    if openstack server show rhel7|grep ERROR ; then
+    if openstack server show el7|grep ERROR ; then
         echo could not create server
-        openstack server show rhel7
+        openstack server show el7
         exit 1
     fi
     ii=`expr $ii - 1`
@@ -201,11 +205,11 @@ done
 
 if [ $ii = 0 ] ; then
     echo $LINENO server was not active after $BOOT_TIMEOUT seconds
-    openstack server show rhel7
+    openstack server show el7
     exit 1
 fi
 
-VM_IP=$(openstack server show rhel7 | sed -n '/ addresses / { s/^.*addresses.*private=\([0-9.][0-9.]*\).*$/\1/; p; q }')
+VM_IP=$(openstack server show el7 | sed -n '/ addresses / { s/^.*addresses.*private=\([0-9.][0-9.]*\).*$/\1/; p; q }')
 if ! myping $VM_IP $BOOT_TIMEOUT ; then
     echo $LINENO "server did not respond to ping $VM_IP"
     exit 1
