@@ -34,8 +34,6 @@ CONF.register_opts([
     cfg.IntOpt('connect_retries', default=1,
                help='How many times to attempt to retry '
                'the connection to IPA before giving up'),
-    cfg.StrOpt('json_rpc_version', default='2.65',
-               help='IPA RPC JSON version'),
     cfg.MultiOpt('inject_files', item_type=types.String(), default=[],
                  help='Files to inject into the new VM.  Specify as /path/to/file/on/host[ /path/to/file/in/vm/if/different]')
 ])
@@ -160,9 +158,7 @@ class IPANovaHookBase(object):
             xtra_hdrs = {'Content-Type': 'application/json',
                          'Referer': CONF.url}
             cls.session.headers.update(xtra_hdrs)
-            cls.session.verify = False
-            # verify is not working - ssl.py self.sock.getpeercert() fails
-#            cls.session.verify = CONF.cacert
+            cls.session.verify = True
         if not cls.inject_files:
             for fn in CONF.inject_files:
                 hostvm = fn.split(' ')
@@ -193,20 +189,17 @@ class IPANovaHookBase(object):
             LOG.debug("Error: ipa command [%s] returned error [%s]" %
                       (pprint.pformat(ipareq), pprint.pformat(resp)))
         elif errcode:  # not mapped
-            LOG.debug("Ignoring IPA error code %d: %s" %
-                      (errcode, pprint.pformat(resp)))
+            LOG.debug("Ignoring IPA error code %d for command %s: %s" %
+                      (errcode, method, pprint.pformat(resp)))
         return exclass
 
     def _call_and_handle_error(self, ipareq):
-        if 'version' not in ipareq['params'][1]:
-            ipareq['params'][1]['version'] = CONF.json_rpc_version
         need_reauth = False
         while True:
             status_code = 200
             try:
                 if need_reauth:
                     self.session.auth.refresh_auth()
-#                import rpdb; rpdb.set_trace()
                 rawresp = self.session.post(CONF.url,
                                             data=json.dumps(ipareq))
                 status_code = rawresp.status_code
