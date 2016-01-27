@@ -238,33 +238,66 @@ class IPANovaHookBase(object):
 
 class IPABuildInstanceHook(IPANovaHookBase):
 
+    def _get_metadata(self, metadata, name, default_value=None):
+        """
+        Try to get metadata values first from the instance properties
+        then the glance-provided metadata.
+
+        Returns the value if found or a default value if specified.
+        """
+        image = metadata.get('image', {})
+        properties = image.get('properties', {})
+        instance_type = image.get('instance_type', {})
+        LOG.debug("instance_type: %s", instance_type)
+        instance_properties = metadata.get('instance_properties', {})
+        instance_metadata = instance_properties.get('metadata', {})
+
+        if name in instance_metadata:
+            return instance_metadata.get(name)
+        elif name in properties:
+            return properties.get(name)
+        elif name in instance_type:
+            return str(instance_type.get(name))
+        return default_value
+
     def pre(self, *args, **kwargs):
         LOG.debug('In IPABuildInstanceHook.pre: args [%s] kwargs [%s]',
                   pprint.pformat(args), pprint.pformat(kwargs))
+        for i in xrange(8):
+            LOG.debug("IPABuildInstanceHook.pre %d: %s", i, args[i])
         # args[8] is the NetworkRequestList of NetworkRequest objects
         # args[7] is the injected_files parameter array
         # the value is ('filename', 'base64 encoded contents')
-        ipaotp = str(uuid.uuid4())
+        ipaotp = uuid.uuid4().hex
         ipainject = ('/tmp/ipaotp', base64.b64encode(ipaotp))
         args[7].extend(self.inject_files)
         args[7].append(ipainject)
-        inst = args[2]
-#        inst.metadata['ipaotp'] = ipaotp
+
         # call ipa host add to add the new host
+        inst = args[2]
         ipareq = {'method': 'host_add', 'id': 0}
         hostname = '%s.%s' % (inst.hostname, getvmdomainname())
         params = [hostname]
+        userclass = self._get_metadata(args[4], 'ipa_userclass', '')
+        location = self._get_metadata(args[4], 'ipa_host_location', '')
+        osdistro = self._get_metadata(args[4], 'os_distro', '')
+        osver = self._get_metadata(args[4], 'os_version', None)
+        platform = self._get_metadata(args[4], 'extra_specs', None)
         args = {
             'description': 'IPA host for %s' % inst.display_description,
             'l': 'Mountain View, CA',
-            'nshostlocation': 'lab 3, 2nd floor',
-            'nshardwareplatform': 'VM',
-            'nsosversion': 'RHEL 7.2',
             'userpassword': ipaotp,
             'force': True # we don't have an ip addr yet - use force to add anyway
         }
-        if 'ipaclass' in inst.metadata:
-            args['userclass'] = inst.metadata['ipaclass']
+        if userclass:
+            args['userclass'] = userclass
+        if osdistro or osver:
+            args['nsosversion'] = '%s %s' % (osdistro, osver)
+            args['nsosversion'] = args['nsosversion'].strip()
+        if location:
+            args['nshostlocation'] = location
+        if platform:
+            args['nshardwareplatform'] = platform
         # # userpassword, random, usercertificate, macaddress
         # # ipasshpubkey, userclass, ipakrbrequirespreauth,
         # # ipakrbokasdelegate, force, no_reverse, ip_address
@@ -286,6 +319,16 @@ class IPADeleteInstanceHook(IPANovaHookBase):
     def pre(self, *args, **kwargs):
         LOG.debug('In IPADeleteInstanceHook.pre: args [%s] kwargs [%s]',
                   pprint.pformat(args), pprint.pformat(kwargs))
+        inst = args[2]
+        # call ipa host delete to remove the host
+        ipareq = {'method': 'host_del', 'id': 0}
+        hostname = '%s.%s' % (inst.hostname, getvmdomainname())
+        params = [hostname]
+        args = {
+            'updatedns': True,
+        }
+        ipareq['params'] = [params, args]
+        self._call_and_handle_error(ipareq)
 
     def post(self, *args, **kwargs):
         LOG.debug('In IPADeleteInstanceHook.post: args [%s] kwargs [%s]',
