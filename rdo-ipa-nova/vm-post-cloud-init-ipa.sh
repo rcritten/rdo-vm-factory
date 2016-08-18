@@ -10,7 +10,8 @@ setenforce 0
 . /mnt/ipa.conf
 
 # Set up entropy source for IPA installer
-rngd -r /dev/hwrng
+#rngd -r /dev/hwrng
+rngd -r /dev/urandom
 
 # I dunno - maybe something needs more time?
 sleep 60

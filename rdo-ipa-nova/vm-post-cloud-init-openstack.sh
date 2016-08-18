@@ -69,7 +69,7 @@ if [ -n "$USE_RDO" ] ; then
 fi
 
 # Install packstack
-yum install -y openstack-packstack
+yum install -y openstack-packstack NetworkManager
 
 # Set up SSH
 ssh-keygen -t rsa -f /root/.ssh/id_rsa -N ""

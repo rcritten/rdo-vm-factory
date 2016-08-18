@@ -9,6 +9,8 @@ SOURCE_DIR=${SOURCE_DIR:-/mnt}
 
 . $SOURCE_DIR/ipa.conf
 
+yum -y install python-novajoin
+
 # Save the IPA FQDN and IP for later use
 IPA_FQDN=$VM_FQDN
 IPA_IP=$VM_IP
@@ -17,18 +19,14 @@ IPA_DOMAIN=$VM_DOMAIN
 # Source our config for OpenStack settings
 . $SOURCE_DIR/openstack.conf
 
-# add python plugin code for ipa
-cp $SOURCE_DIR/novahooks.py /usr/lib/python2.7/site-packages/ipaclient
-
-# add ipa plugin config
-cp $SOURCE_DIR/ipaclient.conf /etc/nova
-
-# this script does the ipa client setup
-cp $SOURCE_DIR/setup-ipa-client.sh /etc/nova
-
 # cloud-config data
 cp $SOURCE_DIR/cloud-config.json /etc/nova
 openstack-config --set /etc/nova/nova.conf DEFAULT vendordata_jsonfile_path /etc/nova/cloud-config.json
+
+# TEMP: Apply vendordata patch. nova is restarted later
+pushd /usr/lib/python2.7/site-packages
+patch -p1 < $SOURCE_DIR/0001-New-style-vendordata-support.patch
+popd
 
 # put nova in debug mode
 openstack-config --set /etc/nova/nova.conf DEFAULT debug True
@@ -37,19 +35,28 @@ openstack-config --set /etc/nova/nova.conf DEFAULT virt_type kvm
 # set the default domain to the IPA domain
 openstack-config --set /etc/nova/nova.conf DEFAULT dhcp_domain $IPA_DOMAIN
 
-# add python plugin to nova entry points
-openstack-config --set /usr/lib/python2.7/site-packages/nova-*.egg-info/entry_points.txt nova.hooks build_instance ipaclient.novahooks:IPABuildInstanceHook
-openstack-config --set /usr/lib/python2.7/site-packages/nova-*.egg-info/entry_points.txt nova.hooks delete_instance ipaclient.novahooks:IPADeleteInstanceHook
-openstack-config --set /usr/lib/python2.7/site-packages/nova-*.egg-info/entry_points.txt nova.hooks instance_network_info ipaclient.novahooks:IPANetworkInfoHook
+# Configure the dynamic metadata provider
+openstack-config --set /etc/nova/nova.conf DEFAULT vendordata_providers "StaticJSON, DynamicJSON"
+openstack-config --set /etc/nova/nova.conf DEFAULT vendordata_dynamic_targets 'join@http://127.0.0.1:9999/v1/'
+openstack-config --set /etc/nova/nova.conf DEFAULT vendordata_dynamic_read_timeout 30 
 
-# add keytab, url, ca cert
-rm -f /etc/nova/ipauser.keytab
-ipa-getkeytab -r -s $IPA_FQDN -D "cn=directory manager" -w "$IPA_PASSWORD" -p admin@$IPA_REALM -k /etc/nova/ipauser.keytab
-chown nova:nova /etc/nova/ipauser.keytab
-chmod 0600 /etc/nova/ipauser.keytab
+# Enable notifications
+openstack-config --set /etc/nova/nova.conf DEFAULT notification_driver messaging
+openstack-config --set /etc/nova/nova.conf DEFAULT notification_topic notifications
+openstack-config --set /etc/nova/nova.conf DEFAULT notify_on_state_change vm_state
+
+. /root/keystonerc_admin
+
+# Setup novajoin
+KEYSTONE_AUTH=`grep "^auth_uri" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
+KEYSTONE_IDENTITY=`grep "^identity_uri" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
+NOVA_PASSWORD=`grep "^admin_password" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
+/usr/sbin/novajoin-install --principal admin --password "$IPA_PASSWORD" --keystone-auth="$KEYSTONE_AUTH" --keystone-identity="$KEYSTONE_IDENTITY" --nova-password="$NOVA_PASSWORD"
+
+systemctl start novajoin-server.service
+systemctl start novajoin-notify.service
 
 # need a real el7 image in order to run ipa-client-install
-. /root/keystonerc_admin
 #if [ -n "$USE_CENTOS" ] ; then
     openstack image create el7 --file $SOURCE_DIR/CentOS-7-x86_64-GenericCloud.qcow2
 #else
@@ -85,7 +92,7 @@ ONBOOT=yes
 NM_CONTROLLED=no
 EOF
     systemctl restart network.service
-    openstack-config --set /etc/neutron/plugins/openvswitch/ovs_neutron_plugin.ini ovs bridge_mappings extnet:br-ex
+    openstack-config --set /etc/neutron/plugins/ml2/openvswitch_agent.ini ovs bridge_mappings extnet:br-ex
     openstack-config --set /etc/neutron/plugin.ini ml2 type_drivers vxlan,flat,vlan
 
 fi
@@ -127,10 +134,10 @@ if [ -n "$USE_PROVIDER_NETWORK" ] ; then
     route
 fi
 
-SEC_GRP_IDS=$(neutron security-group-list | awk '/ default / {print $2}')
-PUB_NET=$(neutron net-list | awk '/ public / {print $2}')
-PRIV_NET=$(neutron net-list | awk '/ private / {print $2}')
-ROUTER_ID=$(neutron router-list | awk ' /router1/ {print $2}')
+SEC_GRP_IDS=$(openstack security group list | awk '/ default / {print $2}')
+PUB_NET=$(openstack network list | awk '/ public / {print $2}')
+PRIV_NET=$(openstack network list | awk '/ private / {print $2}')
+ROUTER_ID=$(openstack router list | awk ' /router1/ {print $2}')
 # Set the Neutron gateway for router
 neutron router-gateway-set $ROUTER_ID $PUB_NET
 
@@ -145,10 +152,13 @@ EOF
 
 #Add security group rules to enable ping and ssh:
 for secgrpid in $SEC_GRP_IDS ; do
-    neutron security-group-rule-create --protocol icmp \
-            --direction ingress --remote-ip-prefix 0.0.0.0/0 $secgrpid
-    neutron security-group-rule-create --protocol tcp  \
-            --port-range-min 22 --port-range-max 22 --direction ingress $secgrpid
+    project=$(openstack security group show $secgrpid | awk '/ project_id / {print $4}')
+    openstack security group rule create --protocol icmp \
+            --ingress --src-ip 0.0.0.0/0 $secgrpid \
+            --project $project
+    openstack security group rule create --protocol tcp  \
+            --dst-port 22 --ingress $secgrpid \
+            --project $project
 done
 
 BOOT_TIMEOUT=${BOOT_TIMEOUT:-300}
@@ -188,7 +198,7 @@ if [ -n "$DEMO_SETUP" ] ; then
     exit 0
 fi
 
-VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server | awk '/ id / {print $4}')
+VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server --property ipa_enroll=True | awk '/ id / {print $4}')
 
 ii=$BOOT_TIMEOUT
 while [ $ii -gt 0 ] ; do
@@ -210,10 +220,12 @@ if [ $ii = 0 ] ; then
 fi
 
 VM_IP=$(openstack server show el7 | sed -n '/ addresses / { s/^.*addresses.*private=\([0-9.][0-9.]*\).*$/\1/; p; q }')
-if ! myping $VM_IP $BOOT_TIMEOUT ; then
-    echo $LINENO "server did not respond to ping $VM_IP"
-    exit 1
-fi
+
+# With OSP-10 I can't seem to ping the private network?
+#if ! myping $VM_IP $BOOT_TIMEOUT ; then
+#    echo $LINENO "server did not respond to ping $VM_IP"
+#    exit 1
+#fi
 
 PORTID=$(neutron port-list --device-id $VM_UUID | awk "/$VM_IP/ {print \$2}")
 FIPID=$(neutron floatingip-create public | awk '/ id / {print $4}')

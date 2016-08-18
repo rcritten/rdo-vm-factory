@@ -1,0 +1,596 @@
+From 34b5ea5f4436d0d3376d02fe7336c0702cccbcf8 Mon Sep 17 00:00:00 2001
+From: Michael Still <mikal@stillhq.com>
+Date: Wed, 18 May 2016 07:19:51 +1000
+Subject: [PATCH] New style vendordata support.
+
+The nova team would like to stop dynamically loading python modules to
+implement vendordata in the metadata service and configdrive. Instead, we
+propose to provide a module which can fetch dynamic vendordata from an
+external REST server.
+
+Things still to do:
+  - Documentation
+  - Support HTTP caching headers
+  - Cache vendordata responses
+  - Write vendordata documentation
+  - Unit test coverage of requests exceptions
+  - Unit test coverage of attempted vd overwrites
+
+Blueprint: vendordata-reboot
+Change-Id: I19c61a637a640a00f90c6bc8e82c38e7d4084493
+---
+ nova/api/metadata/base.py                   | 105 +++++++++++++----
+ nova/api/metadata/handler.py                |   4 +-
+ nova/api/metadata/vendordata.py             |  30 +++++
+ nova/api/metadata/vendordata_dynamic.py     | 124 ++++++++++++++++++++
+ nova/api/metadata/vendordata_json.py        |   4 +-
+ nova/conf/api.py                            | 111 ++++++++++++++++++
+ nova/virt/libvirt/driver.py                 |   2 +-
+ 11 files changed, 588 insertions(+), 29 deletions(-)
+ create mode 100644 nova/api/metadata/vendordata.py
+ create mode 100644 nova/api/metadata/vendordata_dynamic.py
+
+diff --git a/nova/api/metadata/base.py b/nova/api/metadata/base.py
+index c29a14b..4b9bba8 100644
+--- a/nova/api/metadata/base.py
++++ b/nova/api/metadata/base.py
+@@ -28,12 +28,16 @@ import six
+ 
+ from nova.api.ec2 import ec2utils
+ from nova.api.metadata import password
++from nova.api.metadata import vendordata
++from nova.api.metadata import vendordata_dynamic
++from nova.api.metadata import vendordata_json
+ from nova import availability_zones as az
+ from nova import block_device
+ from nova.cells import opts as cells_opts
+ from nova.cells import rpcapi as cells_rpcapi
+ import nova.conf
+ from nova import context
++from nova.i18n import _LI, _LW
+ from nova import network
+ from nova.network.security_group import openstack_driver
+ from nova import objects
+@@ -56,18 +60,26 @@ VERSIONS = [
+     '2009-04-04',
+ ]
+ 
++# NOTE(mikal): think of these strings as version numbers. They traditionally
++# correlate with OpenStack release dates, with all the changes for a given
++# release bundled into a single version. Note that versions in the future are
++# hidden from the listing, but can still be requested explicitly, which is
++# required for testing purposes. We know this isn't great, but its inherited
++# from EC2, which this needs to be compatible with.
+ FOLSOM = '2012-08-10'
+ GRIZZLY = '2013-04-04'
+ HAVANA = '2013-10-17'
+ LIBERTY = '2015-10-15'
+-NEWTON = '2016-06-30'
++NEWTON_ONE = '2016-06-30'
++NEWTON_TWO = '2016-10-06'
+ 
+ OPENSTACK_VERSIONS = [
+     FOLSOM,
+     GRIZZLY,
+     HAVANA,
+     LIBERTY,
+-    NEWTON,
++    NEWTON_ONE,
++    NEWTON_TWO,
+ ]
+ 
+ VERSION = "version"
+@@ -75,6 +87,7 @@ CONTENT = "content"
+ CONTENT_DIR = "content"
+ MD_JSON_NAME = "meta_data.json"
+ VD_JSON_NAME = "vendor_data.json"
++VD2_JSON_NAME = "vendor_data2.json"
+ NW_JSON_NAME = "network_data.json"
+ UD_NAME = "user_data"
+ PASS_NAME = "password"
+@@ -96,7 +109,8 @@ class InstanceMetadata(object):
+     """Instance metadata."""
+ 
+     def __init__(self, instance, address=None, content=None, extra_md=None,
+-                 network_info=None, vd_driver=None, network_metadata=None):
++                 network_info=None, vd_driver=None, network_metadata=None,
++                 request_context=None):
+         """Creation of this object should basically cover all time consuming
+         collection.  Methods after that should not cause time delays due to
+         network operations or lengthy cpu operations.
+@@ -182,6 +196,19 @@ class InstanceMetadata(object):
+ 
+         self.route_configuration = None
+ 
++        # NOTE(mikal): the decision to not pass extra_md here like we
++        # do to the StaticJSON driver is deliberate. extra_md will
++        # contain the admin password for the instance, and we shouldn't
++        # pass that to external services.
++        self.vendordata_providers = {
++            'StaticJSON': vendordata_json.JsonFileVendorData(
++                instance=instance, address=address,
++                extra_md=extra_md, network_info=network_info),
++            'DynamicJSON': vendordata_dynamic.DynamicVendorData(
++                instance=instance, address=address,
++                network_info=network_info, context=request_context)
++        }
++
+     def _route_configuration(self):
+         if self.route_configuration:
+             return self.route_configuration
+@@ -189,6 +216,7 @@ class InstanceMetadata(object):
+         path_handlers = {UD_NAME: self._user_data,
+                          PASS_NAME: self._password,
+                          VD_JSON_NAME: self._vendor_data,
++                         VD2_JSON_NAME: self._vendor_data2,
+                          MD_JSON_NAME: self._metadata_as_json,
+                          NW_JSON_NAME: self._network_data,
+                          VERSION: self._handle_version,
+@@ -342,7 +370,7 @@ class InstanceMetadata(object):
+         if self._check_os_version(LIBERTY, version):
+             metadata['project_id'] = self.instance.project_id
+ 
+-        if self._check_os_version(NEWTON, version):
++        if self._check_os_version(NEWTON_ONE, version):
+             metadata['devices'] = self._get_device_metadata()
+ 
+         self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+@@ -425,6 +453,8 @@ class InstanceMetadata(object):
+             ret.append(VD_JSON_NAME)
+         if self._check_os_version(LIBERTY, version):
+             ret.append(NW_JSON_NAME)
++        if self._check_os_version(NEWTON_TWO, version):
++            ret.append(VD2_JSON_NAME)
+ 
+         return ret
+ 
+@@ -446,7 +476,43 @@ class InstanceMetadata(object):
+     def _vendor_data(self, version, path):
+         if self._check_os_version(HAVANA, version):
+             self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+-            return jsonutils.dump_as_bytes(self.vddriver.get())
++
++            # NOTE(mikal): backwards compatability... If the deployer has
++            # specified providers, and one of those providers is StaticJSON,
++            # then do that thing here. Otherwise, if the deployer has
++            # specified an old style driver here, then use that. This second
++            # bit can be removed once old style vendordata is fully deprecated
++            # and removed.
++            if (CONF.vendordata_providers and
++                'StaticJSON' in CONF.vendordata_providers):
++                return jsonutils.dump_as_bytes(
++                    self.vendordata_providers['StaticJSON'].get())
++            else:
++                # TODO(mikal): when we removed the old style vendordata
++                # drivers, we need to remove self.vddriver as well.
++                return jsonutils.dump_as_bytes(self.vddriver.get())
++
++        raise KeyError(path)
++
++    def _vendor_data2(self, version, path):
++        if self._check_os_version(NEWTON_TWO, version):
++            self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
++
++            j = {}
++            for provider in CONF.vendordata_providers:
++                if provider == 'StaticJSON':
++                    j['static'] = self.vendordata_providers['StaticJSON'].get()
++                else:
++                    values = self.vendordata_providers[provider].get()
++                    for key in list(values):
++                        if key in j:
++                            LOG.warning(_LW('Removing duplicate metadata key: '
++                                            '%s'), key, instance=self.instance)
++                            del values[key]
++                    j.update(values)
++
++            return jsonutils.dump_as_bytes(j)
++
+         raise KeyError(path)
+ 
+     def _check_version(self, required, requested, versions=VERSIONS):
+@@ -490,7 +556,7 @@ class InstanceMetadata(object):
+                 if OPENSTACK_VERSIONS != versions:
+                     LOG.debug("future versions %s hidden in version list",
+                               [v for v in OPENSTACK_VERSIONS
+-                               if v not in versions])
++                               if v not in versions], instance=self.instance)
+                 versions += ["latest"]
+             else:
+                 versions = VERSIONS + ["latest"]
+@@ -544,6 +610,11 @@ class InstanceMetadata(object):
+                 path = 'openstack/%s/%s' % (version, NW_JSON_NAME)
+                 yield (path, self.lookup(path))
+ 
++            if self._check_version(NEWTON_TWO, version,
++                                   ALL_OPENSTACK_VERSIONS):
++                path = 'openstack/%s/%s' % (version, VD2_JSON_NAME)
++                yield (path, self.lookup(path))
++
+         for (cid, content) in six.iteritems(self.content):
+             yield ('%s/%s/%s' % ("openstack", CONTENT_DIR, cid), content)
+ 
+@@ -578,24 +649,11 @@ class RouteConfiguration(object):
+         return path_handler(version, path)
+ 
+ 
+-class VendorDataDriver(object):
+-    """The base VendorData Drivers should inherit from."""
+-
+-    def __init__(self, *args, **kwargs):
+-        """Init method should do all expensive operations."""
+-        self._data = {}
+-
+-    def get(self):
+-        """Return a dictionary of primitives to be rendered in metadata
+-
+-        :return: A dictionary or primitives.
+-        """
+-        return self._data
+-
+-
+ def get_metadata_by_address(address):
+     ctxt = context.get_admin_context()
+     fixed_ip = network.API().get_fixed_ip_by_address(ctxt, address)
++    LOG.info(_LI('Fixed IP %(ip)s translates to instance UUID %(uuid)s'),
++             {'ip': address, 'uuid': fixed_ip['instance_uuid']})
+ 
+     return get_metadata_by_instance_id(fixed_ip['instance_uuid'],
+                                        address,
+@@ -653,3 +711,8 @@ def find_path_in_tree(data, path_tokens):
+                 raise KeyError("/".join(path_tokens[0:i]))
+             data = data[path_tokens[i]]
+     return data
++
++
++# NOTE(mikal): this alias is to stop old style vendordata plugins from breaking
++# post refactor. It should be removed when we finish deprecating those plugins.
++VendorDataDriver = vendordata.VendorDataDriver
+diff --git a/nova/api/metadata/handler.py b/nova/api/metadata/handler.py
+index 41e5741..edf9628 100644
+--- a/nova/api/metadata/handler.py
++++ b/nova/api/metadata/handler.py
+@@ -133,7 +133,7 @@ class MetadataRequestHandler(wsgi.Application):
+         try:
+             meta_data = self.get_metadata_by_remote_address(remote_address)
+         except Exception:
+-            LOG.exception(_LE('Failed to get metadata for IP: %s'),
++            LOG.exception(_LE('Failed to get metadata for IP %s'),
+                           remote_address)
+             msg = _('An unknown error has occurred. '
+                     'Please try your request again.')
+@@ -141,7 +141,7 @@ class MetadataRequestHandler(wsgi.Application):
+                                                explanation=six.text_type(msg))
+ 
+         if meta_data is None:
+-            LOG.error(_LE('Failed to get metadata for IP: %s'),
++            LOG.error(_LE('Failed to get metadata for IP %s: no metadata'),
+                       remote_address)
+ 
+         return meta_data
+diff --git a/nova/api/metadata/vendordata.py b/nova/api/metadata/vendordata.py
+new file mode 100644
+index 0000000..e58b07c
+--- /dev/null
++++ b/nova/api/metadata/vendordata.py
+@@ -0,0 +1,30 @@
++# Copyright 2010 United States Government as represented by the
++# Administrator of the National Aeronautics and Space Administration.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++
++class VendorDataDriver(object):
++    """The base VendorData Drivers should inherit from."""
++
++    def __init__(self, *args, **kwargs):
++        """Init method should do all expensive operations."""
++        self._data = {}
++
++    def get(self):
++        """Return a dictionary of primitives to be rendered in metadata
++
++        :return: A dictionary of primitives.
++        """
++        return self._data
+diff --git a/nova/api/metadata/vendordata_dynamic.py b/nova/api/metadata/vendordata_dynamic.py
+new file mode 100644
+index 0000000..2736936
+--- /dev/null
++++ b/nova/api/metadata/vendordata_dynamic.py
+@@ -0,0 +1,124 @@
++# Copyright 2016 Rackspace Australia
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Render vendordata as stored fetched from REST microservices."""
++
++import requests
++
++from oslo_log import log as logging
++from oslo_serialization import jsonutils
++from oslo_utils import excutils
++
++from nova.api.metadata import vendordata
++import nova.conf
++from nova.i18n import _LW
++
++CONF = nova.conf.CONF
++LOG = logging.getLogger(__name__)
++
++
++def generate_identity_headers(context, status='Confirmed'):
++    return {
++        'X-Auth-Token': getattr(context, 'auth_token', None),
++        'X-User-Id': getattr(context, 'user', None),
++        'X-Project-Id': getattr(context, 'tenant', None),
++        'X-Roles': ','.join(getattr(context, 'roles', [])),
++        'X-Identity-Status': status,
++    }
++
++
++class DynamicVendorData(vendordata.VendorDataDriver):
++    def __init__(self, context=None, instance=None, address=None,
++                 network_info=None):
++        # NOTE(mikal): address and network_info are unused, but can't be
++        # removed / renamed as this interface is shared with the static
++        # JSON plugin.
++        self.context = context
++        self.instance = instance
++
++    def _do_request(self, service_name, url):
++        try:
++            body = {'project-id': self.instance.project_id,
++                    'instance-id': self.instance.uuid,
++                    'image-id': self.instance.image_ref,
++                    'user-data': self.instance.user_data,
++                    'hostname': self.instance.hostname,
++                    'metadata': self.instance.metadata}
++            headers = {'Content-Type': 'application/json',
++                       'Accept': 'application/json',
++                       'User-Agent': 'openstack-nova-vendordata'}
++
++            if self.context:
++                headers.update(generate_identity_headers(self.context))
++
++            # SSL verification
++            verify = url.startswith('https://')
++
++            if verify and CONF.vendordata_dynamic_ssl_certfile:
++                verify = CONF.vendordata_dynamic_ssl_certfile
++
++            timeout = (CONF.vendordata_dynamic_connect_timeout,
++                       CONF.vendordata_dynamic_read_timeout)
++
++            res = requests.request('POST', url, data=jsonutils.dumps(body),
++                                   headers=headers, verify=verify,
++                                   timeout=timeout)
++            if res.status_code in (requests.codes.OK,
++                                   requests.codes.CREATED,
++                                   requests.codes.ACCEPTED,
++                                   requests.codes.NO_CONTENT):
++                # TODO(mikal): Use the Cache-Control response header to do some
++                # sensible form of caching here.
++                return jsonutils.loads(res.text)
++
++            return {}
++
++        except (TypeError, ValueError, requests.exceptions.RequestException,
++                requests.exceptions.SSLError) as e:
++            with excutils.save_and_reraise_exception():
++                LOG.warning(_LW('Error from dynamic vendordata service '
++                                '%(service_name)s at %(url)s: %(error)s'),
++                            {'service_name': service_name,
++                             'url': url,
++                             'error': e},
++                            instance=self.instance)
++
++    def get(self):
++        j = {}
++
++        for target in CONF.vendordata_dynamic_targets:
++            # NOTE(mikal): a target is composed of the following:
++            #    name@url
++            # where name is the name to use in the metadata handed to
++            # instances, and url is the URL to fetch it from
++            if target.find('@') == -1:
++                LOG.warning(_LW('Vendordata target %(target)s lacks a name. '
++                                'Skipping'),
++                            {'target': target}, instance=self.instance)
++                continue
++
++            tokens = target.split('@')
++            name = tokens[0]
++            url = '@'.join(tokens[1:])
++
++            if name in j:
++                LOG.warning(_LW('Vendordata already contains an entry named '
++                                '%(target)s. Skipping'),
++                            {'target': target}, instance=self.instance)
++                continue
++
++            j[name] = self._do_request(name, url)
++
++        return j
+diff --git a/nova/api/metadata/vendordata_json.py b/nova/api/metadata/vendordata_json.py
+index 240c21a..2960d15 100644
+--- a/nova/api/metadata/vendordata_json.py
++++ b/nova/api/metadata/vendordata_json.py
+@@ -20,7 +20,7 @@ import errno
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+ 
+-from nova.api.metadata import base
++from nova.api.metadata import vendordata
+ import nova.conf
+ from nova.i18n import _LW
+ 
+@@ -28,7 +28,7 @@ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ 
+ 
+-class JsonFileVendorData(base.VendorDataDriver):
++class JsonFileVendorData(vendordata.VendorDataDriver):
+     def __init__(self, *args, **kwargs):
+         super(JsonFileVendorData, self).__init__(*args, **kwargs)
+         data = {}
+diff --git a/nova/conf/api.py b/nova/conf/api.py
+index 420d65f..d36cf11 100644
+--- a/nova/conf/api.py
++++ b/nova/conf/api.py
+@@ -124,6 +124,117 @@ request. The value should be the full dot-separated path to the class to use.
+ 
+     None
+ """),
++    cfg.ListOpt('vendordata_providers',
++                default=[],
++                help="""
++A list of vendordata providers.
++
++vendordata providers are how deployers can provide metadata via configdrive and
++metadata that is specific to their deployment. There are currently two
++supported providers: StaticJSON and DynamicJSON.
++
++StaticJSON reads a JSON file configured by the flag vendordata_jsonfile_path
++and places the JSON from that file into vendor_data.json and vendor_data2.json.
++
++DynamicJSON is configured via the vendordata_dynamic_targets flag, which is
++documented separately. For each of the endpoints specified in that flag, a
++section is added to the vendor_data2.json.
++
++For more information on the requirements for implementing a vendordata
++dynamic endpoint, please see the vendordata.rst file in the nova developer
++reference.
++
++* Possible values:
++
++    A list of vendordata providers, with StaticJSON and DynamicJSON being
++    current options.
++
++* Services that use this:
++
++    ``nova-api``
++
++* Related options:
++
++    vendordata_dynamic_targets
++    vendordata_dynamic_ssl_certfile
++    vendordata_dynamic_connect_timeout
++    vendordata_dynamic_read_timeout
++"""),
++    cfg.ListOpt('vendordata_dynamic_targets',
++                default=[],
++                help="""
++A list of targets for the dynamic vendordata provider. These targets are of
++the form <name>@<url>.
++
++The dynamic vendordata provider collects metadata by contacting external REST
++services and querying them for information about the instance. This behaviour
++is documented in the vendordata.rst file in the nova developer reference.
++"""),
++    cfg.StrOpt('vendordata_dynamic_ssl_certfile',
++               default='',
++               help="""
++Path to an optional certificate file or CA bundle to verify dynamic vendordata
++REST services ssl certificates against.
++
++* Possible values:
++
++    An empty string, or a path to a valid certificate file
++
++* Services that use this:
++
++    ``nova-api``
++
++* Related options:
++
++    vendordata_providers
++    vendordata_dynamic_targets
++    vendordata_dynamic_connect_timeout
++    vendordata_dynamic_read_timeout
++"""),
++    cfg.IntOpt('vendordata_dynamic_connect_timeout',
++               default=5,
++               min=3,
++               help="""
++Maximum wait time for an external REST service to connect.
++
++* Possible values:
++
++    Any integer with a value greater than three (the TCP packet retransmission
++    timeout). Note that instance start may be blocked during this wait time,
++    so this value should be kept small.
++
++* Services that use this:
++
++    ``nova-api``
++
++* Related options:
++
++    vendordata_providers
++    vendordata_dynamic_targets
++    vendordata_dynamic_ssl_certfile
++    vendordata_dynamic_read_timeout
++"""),
++    cfg.IntOpt('vendordata_dynamic_read_timeout',
++               default=5,
++               help="""
++Maximum wait time for an external REST service to return data once connected.
++
++* Possible values:
++
++    Any integer. Note that instance start is blocked during this wait time,
++    so this value should be kept small.
++
++* Services that use this:
++
++    ``nova-api``
++
++* Related options:
++
++    vendordata_providers
++    vendordata_dynamic_targets
++    vendordata_dynamic_ssl_certfile
++    vendordata_dynamic_connect_timeout
++"""),
+     cfg.IntOpt("metadata_cache_expiration",
+             default=15,
+             help="""
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 457eac0..0692d57 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -3158,7 +3158,7 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+                 inst_md = instance_metadata.InstanceMetadata(
+                     instance, content=files, extra_md=extra_md,
+-                    network_info=network_info)
++                    network_info=network_info, request_context=context)
+ 
+                 cdb = configdrive.ConfigDriveBuilder(instance_md=inst_md)
+                 with cdb:
+-- 
+2.5.0
+
