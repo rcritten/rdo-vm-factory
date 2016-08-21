@@ -56,6 +56,11 @@ NOVA_PASSWORD=`grep "^admin_password" /etc/nova/nova.conf | cut -d= -f2 | sed 's
 systemctl start novajoin-server.service
 systemctl start novajoin-notify.service
 
+# If a SSH key was provided, create a keypair in openstack
+if [ -e /root/.ssh/id_rsa.pub ]; then
+    openstack keypair create --public-key /root/.ssh/id_rsa.pub osuser
+fi
+
 # need a real el7 image in order to run ipa-client-install
 #if [ -n "$USE_CENTOS" ] ; then
     openstack image create el7 --file $SOURCE_DIR/CentOS-7-x86_64-GenericCloud.qcow2
@@ -198,7 +203,13 @@ if [ -n "$DEMO_SETUP" ] ; then
     exit 0
 fi
 
-VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server --property ipa_enroll=True | awk '/ id / {print $4}')
+if [ -e /root/.ssh/id_rsa.pub ]; then
+    OPT_CMD=" --key-name osuser"
+else
+    OPT_CMD=""
+fi
+
+VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server --property ipa_enroll=True $OPT_CMD | awk '/ id / {print $4}')
 
 ii=$BOOT_TIMEOUT
 while [ $ii -gt 0 ] ; do
