@@ -9,8 +9,6 @@ SOURCE_DIR=${SOURCE_DIR:-/mnt}
 
 . $SOURCE_DIR/ipa.conf
 
-yum -y install python-novajoin
-
 # Save the IPA FQDN and IP for later use
 IPA_FQDN=$VM_FQDN
 IPA_IP=$VM_IP
@@ -19,14 +17,8 @@ IPA_DOMAIN=$VM_DOMAIN
 # Source our config for OpenStack settings
 . $SOURCE_DIR/openstack.conf
 
-# cloud-config data
-cp $SOURCE_DIR/cloud-config.json /etc/nova
-openstack-config --set /etc/nova/nova.conf DEFAULT vendordata_jsonfile_path /etc/nova/cloud-config.json
-
-# TEMP: Apply vendordata patch. nova is restarted later
-pushd /usr/lib/python2.7/site-packages
-patch -p1 < $SOURCE_DIR/0001-New-style-vendordata-support.patch
-popd
+# Get Keystone credentials
+. /root/keystonerc_admin
 
 # put nova in debug mode
 openstack-config --set /etc/nova/nova.conf DEFAULT debug True
@@ -45,13 +37,17 @@ openstack-config --set /etc/nova/nova.conf DEFAULT notification_driver messaging
 openstack-config --set /etc/nova/nova.conf DEFAULT notification_topic notifications
 openstack-config --set /etc/nova/nova.conf DEFAULT notify_on_state_change vm_state
 
-. /root/keystonerc_admin
-
 # Setup novajoin
-KEYSTONE_AUTH=`grep "^auth_uri" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
+KEYSTONE_AUTH_URI=`grep "^auth_uri" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
+KEYSTONE_AUTH_URL=`grep "^auth_url" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
 KEYSTONE_IDENTITY=`grep "^identity_uri" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
 NOVA_PASSWORD=`grep "^admin_password" /etc/nova/nova.conf | cut -d= -f2 | sed 's/ //g'`
-/usr/sbin/novajoin-install --principal admin --password "$IPA_PASSWORD" --keystone-auth="$KEYSTONE_AUTH" --keystone-identity="$KEYSTONE_IDENTITY" --nova-password="$NOVA_PASSWORD"
+
+# Configure novajoin service
+/usr/sbin/novajoin-install --principal admin --password "$IPA_PASSWORD" --keystone-auth-uri="$KEYSTONE_AUTH_URI" --keystone-auth-url="$KEYSTONE_AUTH_URL" --keystone-identity="$KEYSTONE_IDENTITY" --nova-password="$NOVA_PASSWORD"
+
+# Not sure what is hosing up permissions but rpm installs it properly
+chown nova:nova /var/log/novajoin
 
 systemctl start novajoin-server.service
 systemctl start novajoin-notify.service
@@ -140,9 +136,9 @@ if [ -n "$USE_PROVIDER_NETWORK" ] ; then
 fi
 
 SEC_GRP_IDS=$(openstack security group list | awk '/ default / {print $2}')
-PUB_NET=$(openstack network list | awk '/ public / {print $2}')
-PRIV_NET=$(openstack network list | awk '/ private / {print $2}')
-ROUTER_ID=$(openstack router list | awk ' /router1/ {print $2}')
+PUB_NET=$(openstack network show public -f value -c id)
+PRIV_NET=$(openstack network show private -f value -c id)
+ROUTER_ID=$(openstack router show router1 -f value -c id)
 # Set the Neutron gateway for router
 neutron router-gateway-set $ROUTER_ID $PUB_NET
 
@@ -185,7 +181,7 @@ myping() {
 }
 
 # get private network id
-netid=`openstack network list|awk '/ private / {print $2}'`
+netid=$(openstack network show private -f value -c id)
 if [ -z "$netid" ] ; then
     netid=`nova net-list|awk '/ novanetwork / {print $2}'`
 fi
@@ -197,19 +193,14 @@ if [ -z "$netid" ] ; then
     exit 1
 fi
 
-if [ -n "$DEMO_SETUP" ] ; then
-    echo openstack server create el7 --flavor m1.small --image el7 --security-group default \
-         --nic net-id=$netid --property ipaclass=app_server
-    exit 0
-fi
-
 if [ -e /root/.ssh/id_rsa.pub ]; then
     OPT_CMD=" --key-name osuser"
 else
     OPT_CMD=""
 fi
 
-VM_UUID=$(openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipaclass=app_server --property ipa_enroll=True $OPT_CMD | awk '/ id / {print $4}')
+openstack server create el7 --flavor m1.small --image el7 --security-group default --nic net-id=$netid --property ipa_hostclass=app_server --property ipa_enroll=True $OPT_CMD
+VM_UUID=$(openstack server show el7 -f value -c id)
 
 ii=$BOOT_TIMEOUT
 while [ $ii -gt 0 ] ; do
